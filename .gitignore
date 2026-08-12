@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+env/
+.venv/
+
+# generated output
+backend/generated_assets/
+
+# Node
+node_modules/
+dist/
+.vite/
+
+# env / secrets
+.env
+.env.local
+*.env
+
+# logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
