@@ -10,66 +10,142 @@ logger = logging.getLogger(__name__)
 # Try to import from local backend package if running as module, else direct import
 try:
     from .lssn_model import LSSN_UNet
+    from .noise_schedule import NoiseSchedule
+    from .encoders import CLIPConditioner
+    from .vae_utils import LatentVAE
+    from .sampler import DDIMSampler
 except ImportError:
     try:
         from lssn_model import LSSN_UNet
+        from noise_schedule import NoiseSchedule
+        from encoders import CLIPConditioner
+        from vae_utils import LatentVAE
+        from sampler import DDIMSampler
     except ImportError:
         pass # Not critical if we switch to SD
+
+LSSN_CHECKPOINT_PATH = os.path.join(os.path.dirname(__file__), "checkpoints", "lssn_latest.pt")
+
 
 class LSSNService:
     def __init__(self, device="cuda" if torch.cuda.is_available() else "cpu"):
         self.device = device
         self.output_dir = "generated_assets"
         os.makedirs(self.output_dir, exist_ok=True)
-        
+
         logger.info(f"Initializing Image Generation Service on {self.device}...")
-        
+
         try:
-            # For this execution, we will intentionally default to Use SD = False 
-            # to prevent hanging on load, as `runwayml` SD takes huge VRAM and time 
-            # to verify from HuggingFace. Better to use the fast, reliable fallback 
+            # For this execution, we will intentionally default to Use SD = False
+            # to prevent hanging on load, as `runwayml` SD takes huge VRAM and time
+            # to verify from HuggingFace. Better to use the fast, reliable fallback
             # for the UI demonstration unless a specific local model is guaranteed.
             logger.info("Initializing fallback generation strategy (Pollinations API) for speed and reliability...")
             self.use_sd = False
             self.txt2img_pipe = None
             self.img2img_pipe = None
-            
+
         except Exception as e:
             logger.error(f"Failed to configure generation pipeline: {e}")
             self.use_sd = False
             self.txt2img_pipe = None
             self.img2img_pipe = None
 
+        # LSSN inference components are loaded lazily (only if a trained
+        # checkpoint actually exists) so importing this module doesn't pull
+        # in CLIP/VAE weights when there's nothing trained to run yet.
+        self._lssn_model = None
+        self._lssn_conditioner = None
+        self._lssn_vae = None
+        self._lssn_schedule = None
+        self._lssn_load_attempted = False
+
+    def _load_lssn_checkpoint(self):
+        """
+        Lazily loads the trained LSSN checkpoint + its frozen CLIP/VAE codecs,
+        if train_real.py has produced one. Returns True on success.
+        Only attempted once per process; failures are cached so every
+        request doesn't retry a slow, doomed load.
+        """
+        if self._lssn_load_attempted:
+            return self._lssn_model is not None
+        self._lssn_load_attempted = True
+
+        if not os.path.exists(LSSN_CHECKPOINT_PATH):
+            logger.info(
+                f"No trained LSSN checkpoint at {LSSN_CHECKPOINT_PATH} -- "
+                f"falling back to the external image API. Run train_real.py to train one."
+            )
+            return False
+
+        try:
+            logger.info(f"Loading trained LSSN checkpoint from {LSSN_CHECKPOINT_PATH}...")
+            ckpt = torch.load(LSSN_CHECKPOINT_PATH, map_location=self.device)
+            model = LSSN_UNet(
+                model_channels=ckpt["model_channels"], context_dim=ckpt["context_dim"]
+            ).to(self.device)
+            model.load_state_dict(ckpt["ema"])  # sample from EMA weights, see ema.py
+            model.eval()
+
+            self._lssn_model = model
+            self._lssn_conditioner = CLIPConditioner(device=self.device, dtype=torch.float16)
+            self._lssn_vae = LatentVAE(device=self.device, dtype=torch.float16)
+            self._lssn_schedule = NoiseSchedule(timesteps=1000, device=self.device)
+            logger.info(
+                f"Trained LSSN checkpoint loaded (epoch {ckpt.get('epoch')}, "
+                f"step {ckpt.get('global_step')}). Live generation will use it."
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Failed to load LSSN checkpoint, falling back to external API: {e}")
+            self._lssn_model = None
+            return False
+
+    def _generate_with_lssn(self, prompt: str, filepath: str, subject_image_path: str = None):
+        """Real text(+optional reference image)-conditioned DDIM sampling from the trained checkpoint."""
+        from PIL import Image
+
+        c_text = self._lssn_conditioner.encode_text([prompt]).float()
+        if subject_image_path and os.path.exists(subject_image_path):
+            ref = Image.open(subject_image_path).convert("RGB")
+            c_image = self._lssn_conditioner.encode_image([ref]).float()
+        else:
+            c_image = self._lssn_conditioner.null_image(1).float()
+
+        uncond_text = self._lssn_conditioner.null_text(1).float()
+        uncond_image = self._lssn_conditioner.null_image(1).float()
+
+        sampler = DDIMSampler(self._lssn_schedule, num_inference_steps=50)
+        latent_shape = (1, 4, LatentVAE.IMAGE_SIZE // 8, LatentVAE.IMAGE_SIZE // 8)
+        x0 = sampler.sample(
+            self._lssn_model, latent_shape, c_text, c_image, uncond_text, uncond_image,
+            guidance_scale=7.5, device=self.device,
+        )
+        image = self._lssn_vae.to_pil(self._lssn_vae.decode(x0))[0]
+        image.save(filepath)
+
     def generate_image(self, prompt: str, subject_image_path: str = None, character_label: str = None):
         """
-        Generates an image based on text prompt.
-        Demonstrates the LSSN_UNet architecture in action.
+        Generates an image based on text prompt. Uses the trained LSSN
+        checkpoint if train_real.py has produced one; otherwise falls back
+        to an external image API (documented in README.md's Status section
+        as a placeholder path pending a trained checkpoint).
         """
         logger.info(f"Generating image for prompt: {prompt}")
-        
+
         filename = f"gen_{os.urandom(4).hex()}.png"
         filepath = os.path.join(self.output_dir, filename)
 
-        # Ensure LSSN_UNet is instantiated to demonstrate the project build
-        try:
-            logger.info("Executing LSSN_UNet demonstration pass...")
-            dummy_unet = LSSN_UNet(context_dim=768).to(self.device)
-            dummy_x = torch.randn(1, 4, 64, 64).to(self.device)
-            dummy_t = torch.tensor([500]).to(self.device)
-            dummy_c_text = torch.randn(1, 77, 768).to(self.device)
-            dummy_c_image = torch.randn(1, 1, 768).to(self.device)
-            
-            with torch.no_grad():
-                _ = dummy_unet(dummy_x, dummy_t, dummy_c_text, dummy_c_image)
-            logger.info("LSSN_UNet forward pass successful. The architecture is sound.")
-            # Clear memory
-            del dummy_unet, dummy_x, dummy_t, dummy_c_text, dummy_c_image
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except Exception as e:
-            logger.error(f"LSSN_UNet demonstration failed: {e}")
+        if self._load_lssn_checkpoint():
+            try:
+                full_prompt = f"{character_label}, {prompt}" if character_label else prompt
+                self._generate_with_lssn(full_prompt, filepath, subject_image_path)
+                logger.info(f"Generated image with trained LSSN checkpoint: {filepath}")
+                return filepath
+            except Exception as e:
+                logger.error(f"LSSN inference failed, falling back to external API: {e}")
 
-        # Generation Fallback Logic
+        # Generation Fallback Logic (no trained checkpoint, or LSSN inference failed)
         import urllib.request
         import urllib.parse
         

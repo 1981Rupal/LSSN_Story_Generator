@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+import torch.utils.checkpoint
 from lssn_modules import BasicTransformerBlock
 
 class ResnetBlock(nn.Module):
@@ -67,9 +68,19 @@ class Upsample(nn.Module):
 
 class LSSN_UNet(nn.Module):
     def __init__(self, in_channels=4, out_channels=4, model_channels=320, num_res_blocks=2,
-                 channel_mult=(1, 2, 4), num_heads=8, dim_head=64, context_dim=768):
+                 channel_mult=(1, 2, 4), num_heads=8, dim_head=64, context_dim=768,
+                 use_checkpoint=False):
         super().__init__()
         self.context_dim = context_dim
+        # Gradient checkpointing (Chen et al. 2016) trades recompute for memory:
+        # activations are dropped after the forward pass and recomputed during
+        # backward instead of kept resident. LSSN's dual-path training runs this
+        # UNet three times per step (fused/text_only/image_only) with all three
+        # graphs alive simultaneously before a single backward() call, which is
+        # what pushed a single training step past 8GB VRAM in the initial GPU
+        # verification run. Opt-in and off by default so it doesn't change
+        # anything for the existing dummy smoke test in train_lssn.py.
+        self.use_checkpoint = use_checkpoint
         time_embed_dim = model_channels * 4
         self.time_embed = nn.Sequential(
             nn.Linear(model_channels, time_embed_dim),
@@ -143,6 +154,17 @@ class LSSN_UNet(nn.Module):
         h = x
         features = []
 
+        def run_resnet(layer, h, t_emb):
+            if self.use_checkpoint and self.training:
+                return torch.utils.checkpoint.checkpoint(layer, h, t_emb, use_reentrant=False)
+            return layer(h, t_emb)
+
+        def run_transformer(layer, h, c_text, c_image, mode):
+            fn = lambda h, c_text, c_image: layer(h, c_text, c_image, mode=mode)
+            if self.use_checkpoint and self.training:
+                return torch.utils.checkpoint.checkpoint(fn, h, c_text, c_image, use_reentrant=False)
+            return fn(h, c_text, c_image)
+
         for module in self.input_blocks:
             if isinstance(module, nn.Conv2d):
                 h = module(h)
@@ -151,18 +173,18 @@ class LSSN_UNet(nn.Module):
             elif isinstance(module, nn.ModuleList):
                 for layer in module:
                     if isinstance(layer, ResnetBlock):
-                        h = layer(h, t_emb)
+                        h = run_resnet(layer, h, t_emb)
                     elif isinstance(layer, SpatialTransformer):
-                        h = layer(h, c_text, c_image, mode=mode)
+                        h = run_transformer(layer, h, c_text, c_image, mode)
                         if return_features:
                             features.append(h)
             hs.append(h)
 
         for module in self.middle_block:
              if isinstance(module, ResnetBlock):
-                 h = module(h, t_emb)
+                 h = run_resnet(module, h, t_emb)
              elif isinstance(module, SpatialTransformer):
-                 h = module(h, c_text, c_image, mode=mode)
+                 h = run_transformer(module, h, c_text, c_image, mode)
                  if return_features:
                      features.append(h)
 
@@ -171,9 +193,9 @@ class LSSN_UNet(nn.Module):
              h = torch.cat([h, h_cat], dim=1)
              for layer in module:
                  if isinstance(layer, ResnetBlock):
-                     h = layer(h, t_emb)
+                     h = run_resnet(layer, h, t_emb)
                  elif isinstance(layer, SpatialTransformer):
-                     h = layer(h, c_text, c_image, mode=mode)
+                     h = run_transformer(layer, h, c_text, c_image, mode)
                      if return_features:
                          features.append(h)
                  elif isinstance(layer, Upsample):

@@ -83,13 +83,38 @@ frontend/                React + Vite UI
 ## Status
 
 The UNet, synchronization module, invariance loss, and diffusion schedule are
-implemented and unit-verified (forward-pass shape/gradient checks); training
-to convergence on a real paired text/image dataset has not yet been run. The
-deployed `/generate/visualize` endpoint currently uses an external image API
-as a placeholder path while a trained LSSN checkpoint is pending — the UNet
-forward pass is exercised on every request to validate the architecture, but
-final image output does not yet come from it. This is stated explicitly
-rather than implied, since the distinction matters for reproducing results.
+implemented and GPU-verified end-to-end. Beyond that, a full real (non-dummy)
+training + inference pipeline now exists:
+
+- `encoders.py` — frozen CLIP ViT-L/14 (openai/clip-vit-large-patch14) text
+  and image conditioning, matching SD1.x's exact 768-dim/77-token convention.
+- `vae_utils.py` — frozen pretrained VAE (stabilityai/sd-vae-ft-mse) for
+  image<->latent encode/decode, per Latent Diffusion Models (Rombach et al. 2022).
+- `sampler.py` — DDIM reverse sampling (Song et al. 2021) with
+  classifier-free guidance (Ho & Salimans 2022) — previously nothing turned a
+  trained model's predictions back into an image.
+- `prepare_dataset.py` — materializes a real (prompt, image) training set
+  from DiffusionDB (Wang et al. 2023), not synthetic placeholders.
+- `train_real.py` — the actual training loop over that real data, with EMA
+  weight averaging and CFG conditioning dropout. `train_lssn.py`'s dummy loop
+  is unchanged and still serves as the fast architecture smoke test.
+- `sample_lssn.py` — standalone text(+optional reference image) inference
+  from a trained checkpoint.
+
+A checkpoint has been trained on a small proof-of-concept run (540 real
+image/prompt pairs, 3 epochs, `model_channels=128` instead of the
+architecture's 320-channel default — a deliberate size/VRAM tradeoff for a
+single consumer GPU). `/generate/visualize` now uses that checkpoint via
+`lssn_service.py` when one exists at `backend/checkpoints/lssn_latest.pt`,
+falling back to the external Pollinations API otherwise.
+
+**On output quality**: at this data/compute scale (540 images, ~800
+gradient steps, no dataloader augmentation), samples are unstructured
+color/texture fields, not coherent images — this is expected, not a bug.
+Production-grade text-to-image quality (comparable to Stable Diffusion/SDXL)
+requires orders of magnitude more paired data and compute than a single
+consumer GPU session provides; see Roadmap below for what scaling this up
+would take.
 
 ## Running locally
 
@@ -113,15 +138,32 @@ cd backend
 python train_lssn.py
 ```
 
+**Train (real data, real encoders/VAE, produces a usable checkpoint)**
+```bash
+cd backend
+python prepare_dataset.py   # one-time: materializes backend/data/{train,val}
+python train_real.py        # writes backend/checkpoints/lssn_latest.pt
+python sample_lssn.py "a castle on a floating island" --out sample.png
+```
+
 `start_app.bat` launches both backend and frontend on Windows.
 
 ## Roadmap
 
-- Train on a paired text/image dataset; replace the placeholder generation
-  path with the trained LSSN checkpoint.
+- Scale up training data: thousands-to-millions of real paired examples
+  instead of the current 540-image proof of concept (e.g. a larger
+  DiffusionDB slice, LAION-derived subsets, or a licensed dataset).
+- Scale up model capacity back toward `model_channels=320` (or beyond) once
+  training infrastructure isn't a single 8GB GPU — likely via gradient
+  checkpointing + multi-GPU or cloud training, or parameter-efficient
+  fine-tuning (LoRA) on top of a larger pretrained base.
+- More training steps with a proper LR schedule/warmup, data augmentation,
+  and a validation-loss-based early-stopping signal (data/prepare_dataset.py
+  already reserves a val split that train_real.py doesn't yet use).
 - Ablate λ (invariance loss weight) and report FID/CLIP-score trade-offs
   vs. a single-modality-conditioned baseline.
-- Classifier-free guidance for the dual-path setting.
+- Explore per-modality CFG dropout (drop text/image independently rather
+  than jointly) for finer guidance control at inference.
 
 ## License
 

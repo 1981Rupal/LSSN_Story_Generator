@@ -25,3 +25,13 @@ dist/
 # OS
 .DS_Store
 Thumbs.db
+
+# trained model artifacts / real training data (large binaries, reproducible
+# via prepare_dataset.py + train_real.py -- not source, don't belong in git)
+backend/checkpoints/
+backend/data/
+backend/__pycache__/
+*.pyc
+
+# local Claude Code session config (not project source)
+.claude/
